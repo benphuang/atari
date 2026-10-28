@@ -6,7 +6,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, SupportsFloat
+from typing import Any, Callable, Iterable, Literal, SupportsFloat
 
 try:
     import cv2
@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
+import ale_py
 from gymnasium import spaces
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -29,7 +30,10 @@ from atari_wrappers import (
     FireResetEnv,
     NoopResetEnv,
 )
-from buffers import ReplayBuffer
+from buffers import ReplayBuffer, ReplayBufferSamples
+
+if hasattr(gym, "register_envs"):
+    gym.register_envs(ale_py)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,8 @@ CLEANRL_DEFAULTS = {
     "eval_frequency": 50_000,
     "eval_steps": 10_000,
     "eval_eps": 0.05,
+    "heldout_frequency": 10_000,
+    "replay_storage": "stacked",
     "anneal_start": "zero",
     "preset": "cleanrl",
 }
@@ -94,7 +100,7 @@ ARXIV2013_DEFAULTS = {
     "loss": "dm_sq",
     "optimizer": "dm_rmsprop",
     "use_target_network": False,
-    "frame_skip": 4,
+    "frame_skip": -1,
     "frame_pool": "last",
     "preprocess": "arxiv2013",
     "noop_max": 0,
@@ -106,6 +112,8 @@ ARXIV2013_DEFAULTS = {
     "eval_frequency": 50_000,
     "eval_steps": 10_000,
     "eval_eps": 0.05,
+    "heldout_frequency": 10_000,
+    "replay_storage": "stacked",
     "anneal_start": "zero",
     "preset": "arxiv2013",
 }
@@ -141,6 +149,8 @@ NATURE2015_DEFAULTS = {
     "eval_frequency": 50_000,
     "eval_steps": 10_000,
     "eval_eps": 0.05,
+    "heldout_frequency": 10_000,
+    "replay_storage": "stacked",
     "anneal_start": "learning_starts",
     "preset": "nature2015",
 }
@@ -201,6 +211,10 @@ class Args:
     eval_frequency: int = CLEANRL_DEFAULTS["eval_frequency"]
     eval_steps: int = CLEANRL_DEFAULTS["eval_steps"]
     eval_eps: float = CLEANRL_DEFAULTS["eval_eps"]
+    heldout_frequency: int = CLEANRL_DEFAULTS["heldout_frequency"]
+    """agent steps between held-out Q estimates; 0 disables held-out evaluation"""
+    replay_storage: Literal["stacked", "frames"] = CLEANRL_DEFAULTS["replay_storage"]
+    """replay storage layout: full stacked observations or individual frames"""
     anneal_start: str = CLEANRL_DEFAULTS["anneal_start"]
     preset: str = CLEANRL_DEFAULTS["preset"]
 
@@ -266,6 +280,8 @@ class FrameStackPad(gym.Wrapper):
 
     def __init__(self, env: gym.Env, stack_size: int = 4, mode: str = "repeat") -> None:
         super().__init__(env)
+        if mode not in {"repeat", "zeros"}:
+            raise ValueError(f"Unknown frame-stack padding mode '{mode}'.")
         self.stack_size = stack_size
         self.mode = mode
         self.frames: list[np.ndarray] = []
@@ -296,6 +312,158 @@ class FrameStackPad(gym.Wrapper):
         return stack
 
 
+class FrameReplayBuffer:
+    """Replay buffer storing one image per transition and reconstructing frame stacks."""
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Box,
+        action_space: spaces.Discrete,
+        device: torch.device,
+        frame_stack_pad: str,
+    ) -> None:
+        if len(observation_space.shape) != 3 or observation_space.shape[0] != 4:
+            raise ValueError(f"Frame storage requires observations shaped (4, H, W), got {observation_space.shape}.")
+        if buffer_size < 5:
+            raise ValueError("Frame replay buffer size must be at least 5.")
+        if frame_stack_pad not in {"repeat", "zeros"}:
+            raise ValueError(f"Unknown frame-stack padding mode '{frame_stack_pad}'.")
+        self.buffer_size = buffer_size
+        self.device = device
+        self.frame_stack_pad = frame_stack_pad
+        self.frames = np.zeros((buffer_size, *observation_space.shape[1:]), dtype=observation_space.dtype)
+        self.actions = np.zeros((buffer_size, 1), dtype=action_space.dtype)
+        self.rewards = np.zeros(buffer_size, dtype=np.float32)
+        self.dones = np.zeros(buffer_size, dtype=np.float32)
+        self.episode_starts = np.zeros(buffer_size, dtype=np.bool_)
+        self.truncated_next_frames: dict[int, np.ndarray] = {}
+        self.pos = 0
+        self.full = False
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+        infos: list[dict[str, Any]],
+        *,
+        episode_start: bool = False,
+    ) -> None:
+        index = self.pos
+        next_index = (index + 1) % self.buffer_size
+        self.truncated_next_frames.pop(index, None)
+        self.frames[index] = np.asarray(obs)[0, -1]
+        self.episode_starts[index] = episode_start
+        self.actions[index] = np.asarray(action).reshape(1)
+        self.rewards[index] = float(np.asarray(reward).reshape(-1)[0])
+        self.dones[index] = float(np.asarray(done).reshape(-1)[0])
+        self.frames[next_index] = np.asarray(next_obs)[0, -1]
+        if infos and infos[0].get("_truncated", False):
+            self.truncated_next_frames[index] = np.asarray(next_obs)[0, -1].copy()
+
+        self.pos = next_index
+        if self.pos == 0:
+            self.full = True
+
+    def _valid_indices(self) -> np.ndarray:
+        if not self.full:
+            candidates = range(self.pos)
+        else:
+            excluded = {(self.pos + offset) % self.buffer_size for offset in range(4)}
+            candidates = (index for index in range(self.buffer_size) if index not in excluded)
+        valid = []
+        for index in candidates:
+            try:
+                self._get_stack(index)
+            except ValueError:
+                continue
+            valid.append(index)
+        return np.asarray(valid, dtype=np.int64)
+
+    def sample(self, batch_size: int) -> ReplayBufferSamples:
+        valid = self._valid_indices()
+        if valid.size == 0:
+            raise ValueError("Not enough valid transitions to sample from frame replay buffer.")
+        return self._get_samples(np.random.choice(valid, size=batch_size, replace=True))
+
+    def _get_samples(self, indices: np.ndarray) -> ReplayBufferSamples:
+        observations = np.stack([self._get_stack(index) for index in indices])
+        next_observations = []
+        for index, obs_stack in zip(indices, observations):
+            next_index = (int(index) + 1) % self.buffer_size
+            if self.dones[index] and self._is_valid_index(next_index) and self.episode_starts[next_index]:
+                next_stack = self._get_stack(next_index)
+            else:
+                next_frame = self.truncated_next_frames.get(int(index), self.frames[next_index])
+                next_stack = np.concatenate((obs_stack[1:], next_frame[None]), axis=0)
+            next_observations.append(next_stack)
+
+        return ReplayBufferSamples(
+            torch.as_tensor(observations, device=self.device),
+            torch.as_tensor(self.actions[indices], device=self.device),
+            torch.as_tensor(np.stack(next_observations), device=self.device),
+            torch.as_tensor(self.dones[indices].reshape(-1, 1), device=self.device),
+            torch.as_tensor(self.rewards[indices].reshape(-1, 1), device=self.device),
+        )
+
+    def _is_valid_index(self, index: int) -> bool:
+        if self.full:
+            return index != self.pos and index not in {
+                (self.pos + offset) % self.buffer_size for offset in range(1, 4)
+            }
+        return index < self.pos
+
+    def _get_stack(self, index: int) -> np.ndarray:
+        history = [self.frames[index]]
+        cursor = index
+        while len(history) < 4:
+            if self.episode_starts[cursor]:
+                break
+            previous = (cursor - 1) % self.buffer_size
+            if not self._is_valid_index(previous):
+                raise ValueError(f"Frame history for replay index {index} has been overwritten.")
+            history.append(self.frames[previous])
+            cursor = previous
+        history.reverse()
+        missing = 4 - len(history)
+        if missing:
+            if self.frame_stack_pad == "zeros":
+                padding = [np.zeros_like(history[0]) for _ in range(missing)]
+            else:
+                padding = [history[0] for _ in range(missing)]
+            history = padding + history
+        return np.stack(history, axis=0)
+
+
+class TruncationAwareReplayBuffer(ReplayBuffer):
+    """Keep true final observations for truncated transitions in optimized storage."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.truncated_next_observations: dict[int, np.ndarray] = {}
+
+    def add(self, obs, next_obs, action, reward, done, infos) -> None:
+        index = self.pos
+        self.truncated_next_observations.pop(index, None)
+        if infos and infos[0].get("_truncated", False):
+            self.truncated_next_observations[index] = np.asarray(next_obs)[0].copy()
+        super().add(obs, next_obs, action, reward, done, infos)
+
+    def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
+        samples = super()._get_samples(batch_inds)
+        overrides = [self.truncated_next_observations.get(int(index)) for index in batch_inds]
+        if any(observation is not None for observation in overrides):
+            next_observations = samples.next_observations.clone()
+            for batch_index, observation in enumerate(overrides):
+                if observation is not None:
+                    next_observations[batch_index] = torch.as_tensor(observation, device=self.device)
+            samples = samples._replace(next_observations=next_observations)
+        return samples
+
+
 class SkipEnv(gym.Wrapper):
     """Frame-skip wrapper with reward accumulation and configurable pooling.
 
@@ -310,29 +478,26 @@ class SkipEnv(gym.Wrapper):
         self.pool = pool
         assert env.observation_space.dtype is not None
         assert env.observation_space.shape is not None
-        self._obs_buffer = np.zeros((2, *env.observation_space.shape), dtype=env.observation_space.dtype)
+        if pool not in {"max", "last"}:
+            raise ValueError(f"Unknown frame pool '{pool}'. Expected 'max' or 'last'.")
 
     def step(self, action: int):
         total_reward = 0.0
         terminated = False
         truncated = False
         info: dict[str, Any] = {}
-        for i in range(self.skip):
+        executed_frames: list[np.ndarray] = []
+        for _ in range(self.skip):
             obs, reward, terminated, truncated, info = self.env.step(action)
             total_reward += float(reward)
-            if i == self.skip - 2:
-                self._obs_buffer[0] = obs
-            if i == self.skip - 1:
-                self._obs_buffer[1] = obs
+            executed_frames.append(np.asarray(obs))
             if terminated or truncated:
                 break
 
         if self.pool == "max":
-            obs = self._obs_buffer.max(axis=0)
-        elif self.pool == "last":
-            obs = self._obs_buffer[1]
+            obs = np.maximum.reduce(executed_frames[-2:])
         else:
-            raise ValueError(f"Unknown frame pool '{self.pool}'. Expected 'max' or 'last'.")
+            obs = executed_frames[-1]
         return obs, total_reward, terminated, truncated, info
 
 
@@ -345,7 +510,7 @@ class ArxivPreprocessEnv(gym.ObservationWrapper):
         self.height = 84
         self.width = 84
         assert isinstance(env.observation_space, spaces.Box), f"Expected Box observation space, got {env.observation_space}"
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.height, self.width, 1), dtype=np.uint8)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(self.height, self.width), dtype=np.uint8)
 
     def observation(self, frame: np.ndarray) -> np.ndarray:
         if cv2 is None:
@@ -354,7 +519,22 @@ class ArxivPreprocessEnv(gym.ObservationWrapper):
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         resized = cv2.resize(gray, (84, 110), interpolation=cv2.INTER_LINEAR)
         cropped = resized[self.crop_top : self.crop_top + 84, :]
-        return cropped[:, :, None].astype(np.uint8)
+        return cropped.astype(np.uint8)
+
+
+class CleanRLPreprocessEnv(gym.ObservationWrapper):
+    """CleanRL's explicit RGB resize-then-grayscale preprocessing pipeline."""
+
+    def __init__(self, env: gym.Env) -> None:
+        super().__init__(env)
+        assert isinstance(env.observation_space, spaces.Box), f"Expected Box observation space, got {env.observation_space}"
+        self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84), dtype=np.uint8)
+
+    def observation(self, frame: np.ndarray) -> np.ndarray:
+        if cv2 is None:
+            raise ImportError("OpenCV is required for Atari preprocessing. Install opencv-python-headless.")
+        resized = cv2.resize(np.asarray(frame), (84, 84), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY).astype(np.uint8)
 
 
 class QNetwork(nn.Module):
@@ -363,7 +543,7 @@ class QNetwork(nn.Module):
         self.network_name = network
         self.env = env
         if network == "nature":
-            self.network = nn.Sequential(
+            conv_layers = nn.Sequential(
                 nn.Conv2d(4, 32, kernel_size=8, stride=4),
                 nn.ReLU(),
                 nn.Conv2d(32, 64, kernel_size=4, stride=2),
@@ -371,25 +551,30 @@ class QNetwork(nn.Module):
                 nn.Conv2d(64, 64, kernel_size=3, stride=1),
                 nn.ReLU(),
                 nn.Flatten(),
-                nn.Linear(3136, 512),
+            )
+            flat_dim = int(conv_layers(torch.zeros(1, 4, 84, 84)).shape[1])
+            self.network = nn.Sequential(
+                conv_layers,
+                nn.Linear(flat_dim, 512),
                 nn.ReLU(),
-                nn.Linear(512, env.single_action_space.n),
+                nn.Linear(512, env.action_space.n),
             )
         elif network == "arxiv2013":
-            self.network = nn.Sequential(
+            conv_layers = nn.Sequential(
                 nn.Conv2d(4, 16, kernel_size=8, stride=4),
                 nn.ReLU(),
                 nn.Conv2d(16, 32, kernel_size=4, stride=2),
                 nn.ReLU(),
                 nn.Flatten(),
-                nn.Linear(2592, 256),
-                nn.ReLU(),
-                nn.Linear(256, env.single_action_space.n),
             )
-            flat_dim = self.network[3].out_features if hasattr(self.network[3], "out_features") else None
-            if flat_dim is None:
-                flat_dim = 2592
+            flat_dim = int(conv_layers(torch.zeros(1, 4, 84, 84)).shape[1])
             assert flat_dim == 2592, f"Expected flattened size 2592, got {flat_dim}"
+            self.network = nn.Sequential(
+                conv_layers,
+                nn.Linear(flat_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, env.action_space.n),
+            )
         else:
             raise ValueError(f"Unknown network type '{network}'")
 
@@ -459,12 +644,21 @@ def linear_schedule_with_anchor(start_e: float, end_e: float, duration: int, t: 
     return linear_schedule(start_e, end_e, duration, t)
 
 
-def _print_memory_warning(buffer_size: int) -> None:
-    approx_bytes = buffer_size * 84 * 84 * 4 * 4 * 8
-    if approx_bytes > 28 * 1024 * 1024 * 1024:
+def _print_memory_warning(buffer_size: int, replay_storage: str = "stacked") -> None:
+    channels = 4 if replay_storage == "stacked" else 1
+    approx_bytes = buffer_size * 84 * 84 * channels
+    try:
+        import psutil
+    except ImportError:
+        available_bytes = None
+    else:
+        available_bytes = psutil.virtual_memory().available
+    if available_bytes is None or approx_bytes > available_bytes:
+        available = "unknown" if available_bytes is None else f"{available_bytes / (1024 ** 3):.1f} GiB"
         print(
-            f"Warning: replay buffer of {buffer_size} frames with 4-channel 84x84 observations may exceed "
-            f"the 28 GB target (~{approx_bytes / (1024 ** 3):.1f} GB). Keeping the requested size."
+            f"Warning: replay storage '{replay_storage}' needs approximately "
+            f"{approx_bytes / (1024 ** 3):.1f} GiB; currently available memory is {available}. "
+            "The requested buffer size will not be reduced."
         )
 
 
@@ -512,11 +706,13 @@ def make_env(
         if fire_reset and "FIRE" in env.unwrapped.get_action_meanings() and not eval_mode:
             env = FireResetEnv(env)
 
+        if not eval_mode:
+            env = ClipRewardEnv(env)
+
         if preprocess == "arxiv2013":
             env = ArxivPreprocessEnv(env, crop_top=crop_top)
         else:
-            env = gym.wrappers.ResizeObservation(env, (84, 84))
-            env = gym.wrappers.GrayScaleObservation(env)
+            env = CleanRLPreprocessEnv(env)
 
         if dump_frames > 0:
             env = DumpFrameEnv(env, dump_limit=dump_frames)
@@ -616,6 +812,7 @@ def _run_eval(
         dump_frames=dump_frames,
         eval_mode=True,
     )()
+    eval_rng = random.Random(seed)
     obs, _ = eval_env.reset(seed=seed + 4321)
     obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     episode_returns: list[float] = []
@@ -624,8 +821,8 @@ def _run_eval(
     partial_episode = False
     n_steps = 0
     while n_steps < eval_steps:
-        if random.random() < eval_eps:
-            action = eval_env.action_space.sample()
+        if eval_rng.random() < eval_eps:
+            action = eval_rng.randrange(eval_env.action_space.n)
         else:
             with torch.no_grad():
                 q_values = q_network(obs.unsqueeze(0))
@@ -692,17 +889,18 @@ def _sample_heldout_states(
         eval_mode=True,
     )()
     obs, _ = env.reset(seed=seed + 99)
-    sampled: list[np.ndarray] = []
     rng = np.random.default_rng(seed)
+    states_over_rollout: list[np.ndarray] = []
     for _ in range(steps):
+        states_over_rollout.append(np.asarray(obs, dtype=np.uint8))
         action = int(rng.integers(0, env.action_space.n))
         obs, _, terminated, truncated, _ = env.step(action)
         if terminated or truncated:
             obs, _ = env.reset(seed=seed + 101)
-        if len(sampled) < states:
-            sampled.append(np.asarray(obs, dtype=np.uint8))
+    sample_indices = np.linspace(0, steps - 1, num=min(states, steps), dtype=np.int64)
+    sampled = [states_over_rollout[index] for index in sample_indices]
     env.close()
-    return np.stack(sampled[:states], axis=0)
+    return np.stack(sampled, axis=0)
 
 
 def _log_scalar(writer: SummaryWriter, name: str, value: float, step: int) -> None:
@@ -715,18 +913,28 @@ def _log_scalar(writer: SummaryWriter, name: str, value: float, step: int) -> No
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args = apply_preset(args)
+    assert args.num_envs == 1, "vectorized envs are not supported"
+    if args.replay_storage not in {"stacked", "frames"}:
+        raise ValueError(f"Unknown replay storage '{args.replay_storage}'. Expected 'stacked' or 'frames'.")
+    print(f"Resolved config: {vars(args)}")
 
     if args.loss == "cleanrl" and args.optimizer == "dm_rmsprop":
         print("Warning: dm_rmsprop with the cleanrl mean-squared loss is not the original DeepMind setup.")
 
-    if args.buffer_size > 1_000_000:
-        _print_memory_warning(args.buffer_size)
+    _print_memory_warning(args.buffer_size, args.replay_storage)
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s\n|gymnasium|%s|\n|ale-py|%s|\n|torch|%s|\n|numpy|%s|"
+        % (
+            "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]),
+            gym.__version__,
+            getattr(ale_py, "__version__", "unknown"),
+            torch.__version__,
+            np.__version__,
+        ),
     )
 
     random.seed(args.seed)
@@ -735,63 +943,72 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(
-                args.env_id,
-                args.seed + i,
-                i,
-                args.capture_video,
-                run_name,
-                network=args.network,
-                preprocess=args.preprocess,
-                noop_max=args.noop_max,
-                episodic_life=args.episodic_life,
-                fire_reset=args.fire_reset,
-                frame_skip=args.frame_skip,
-                frame_pool=args.frame_pool,
-                frame_stack_pad=args.frame_stack_pad,
-                crop_top=args.crop_top,
-                dump_frames=args.dump_frames,
-            )
-            for i in range(args.num_envs)
-        ]
-    )
-
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
-    q_network = QNetwork(envs, network=args.network).to(device)
-    optimizer = _make_optimizer(args.optimizer, q_network.parameters(), args.learning_rate)
-    target_network = QNetwork(envs, network=args.network).to(device) if args.use_target_network else None
-    if target_network is not None:
-        target_network.load_state_dict(q_network.state_dict())
-
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        optimize_memory_usage=True,
-        handle_timeout_termination=False,
-    )
-    start_time = time.time()
-    obs, _ = envs.reset(seed=args.seed)
-
-    heldout_states = _sample_heldout_states(
+    env = make_env(
         args.env_id,
         args.seed,
-        frame_skip=args.frame_skip,
-        frame_pool=args.frame_pool,
+        0,
+        args.capture_video,
+        run_name,
+        network=args.network,
         preprocess=args.preprocess,
         noop_max=args.noop_max,
         episodic_life=args.episodic_life,
         fire_reset=args.fire_reset,
-        crop_top=args.crop_top,
+        frame_skip=args.frame_skip,
+        frame_pool=args.frame_pool,
         frame_stack_pad=args.frame_stack_pad,
-        steps=2000,
-        states=500,
-    )
-    heldout_states_tensor = torch.from_numpy(heldout_states).float().to(device).permute(0, 3, 1, 2)
+        crop_top=args.crop_top,
+        dump_frames=args.dump_frames,
+    )()
+
+    assert isinstance(env.action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    env.action_space.seed(args.seed)
+
+    q_network = QNetwork(env, network=args.network).to(device)
+    optimizer = _make_optimizer(args.optimizer, q_network.parameters(), args.learning_rate)
+    target_network = QNetwork(env, network=args.network).to(device) if args.use_target_network else None
+    if target_network is not None:
+        target_network.load_state_dict(q_network.state_dict())
+
+    if args.replay_storage == "frames":
+        rb = FrameReplayBuffer(
+            args.buffer_size,
+            env.observation_space,
+            env.action_space,
+            device,
+            args.frame_stack_pad,
+        )
+    else:
+        rb = TruncationAwareReplayBuffer(
+            args.buffer_size,
+            env.observation_space,
+            env.action_space,
+            device,
+            optimize_memory_usage=True,
+            handle_timeout_termination=False,
+        )
+    start_time = time.time()
+    obs, _ = env.reset(seed=args.seed)
+    episode_start = True
+
+    heldout_states_tensor = None
+    if args.heldout_frequency > 0:
+        heldout_states = _sample_heldout_states(
+            args.env_id,
+            args.seed,
+            frame_skip=args.frame_skip,
+            frame_pool=args.frame_pool,
+            preprocess=args.preprocess,
+            noop_max=args.noop_max,
+            episodic_life=args.episodic_life,
+            fire_reset=args.fire_reset,
+            crop_top=args.crop_top,
+            frame_stack_pad=args.frame_stack_pad,
+            steps=2000,
+            states=500,
+        )
+        assert heldout_states.shape[1:] == (4, 84, 84), f"Expected held-out states shaped (N, 4, 84, 84), got {heldout_states.shape}"
+        heldout_states_tensor = torch.from_numpy(heldout_states).float().to(device)
 
     for global_step in range(args.total_timesteps):
         epsilon = linear_schedule_with_anchor(
@@ -803,48 +1020,65 @@ if __name__ == "__main__":
             args.anneal_start,
         )
         if random.random() < epsilon:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            action = env.action_space.sample()
         else:
-            q_values = q_network(torch.as_tensor(obs, dtype=torch.float32, device=device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            q_values = q_network(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+            action = int(torch.argmax(q_values, dim=1).item())
 
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        if "episode" in info:
+            episode_return = float(np.asarray(info["episode"]["r"]).item())
+            episode_length = int(np.asarray(info["episode"]["l"]).item())
+            print(f"global_step={global_step}, episodic_return={episode_return}")
+            writer.add_scalar("charts/episodic_return", episode_return, global_step)
+            writer.add_scalar("charts/episodic_length", episode_length, global_step)
 
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-        obs = next_obs
+        buffer_info = dict(info)
+        buffer_info["_truncated"] = bool(truncated)
+        buffer_args = (
+            obs[None],
+            next_obs[None],
+            np.array([action]),
+            np.array([reward]),
+            np.array([terminated]),
+            [buffer_info],
+        )
+        if args.replay_storage == "frames":
+            rb.add(*buffer_args, episode_start=episode_start)
+        else:
+            rb.add(*buffer_args)
 
-        if global_step > args.learning_starts and global_step % args.train_frequency == 0:
-            data = rb.sample(args.batch_size)
-            q_values = q_network(data.observations)
-            old_val = q_values.gather(1, data.actions).squeeze()
-            target_values = _compute_td_target(q_network, target_network, data.next_observations, data.rewards, data.dones, args.gamma, args.use_target_network)
-            loss_fn = _resolve_loss(args.loss)
-            loss = loss_fn(target_values, old_val)
+        if terminated or truncated:
+            obs, _ = env.reset()
+            episode_start = True
+        else:
+            obs = next_obs
+            episode_start = False
 
-            if global_step % 100 == 0:
-                writer.add_scalar("losses/td_loss", float(loss.item()), global_step)
-                writer.add_scalar("losses/q_values", float(old_val.mean().item()), global_step)
-                _log_scalar(writer, "charts/SPS", int(global_step / max(time.time() - start_time, 1e-8)), global_step)
+        if global_step > args.learning_starts:
+            if global_step % args.train_frequency == 0:
+                data = rb.sample(args.batch_size)
+                q_values = q_network(data.observations)
+                old_val = q_values.gather(1, data.actions).squeeze(-1)
+                target_values = _compute_td_target(q_network, target_network, data.next_observations, data.rewards, data.dones, args.gamma, args.use_target_network)
+                loss_fn = _resolve_loss(args.loss)
+                loss = loss_fn(target_values, old_val)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                if global_step % 100 == 0:
+                    writer.add_scalar("losses/td_loss", float(loss.item()), global_step)
+                    writer.add_scalar("losses/q_values", float(old_val.mean().item()), global_step)
+                    _log_scalar(writer, "charts/SPS", int(global_step / max(time.time() - start_time, 1e-8)), global_step)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
             if args.use_target_network and global_step % args.target_network_frequency == 0:
                 for target_param, q_param in zip(target_network.parameters(), q_network.parameters()):
                     target_param.data.copy_(args.tau * q_param.data + (1.0 - args.tau) * target_param.data)
 
-        if global_step % 10_000 == 0 and global_step > 0:
+        if args.heldout_frequency > 0 and global_step > 0 and global_step % args.heldout_frequency == 0:
+            assert heldout_states_tensor is not None
             with torch.no_grad():
                 heldout_q = q_network(heldout_states_tensor)
                 heldout_max = heldout_q.max(dim=1).values.mean().item()
@@ -871,6 +1105,7 @@ if __name__ == "__main__":
             writer.add_scalar("eval/mean_return", metrics["mean_return"], global_step)
             writer.add_scalar("eval/max_return", metrics["max_return"], global_step)
             writer.add_scalar("eval/num_episodes", metrics["num_episodes"], global_step)
+            writer.add_scalar("eval/partial", metrics["partial"], global_step)
 
     final_eval = _run_eval(
         args.env_id,
@@ -892,6 +1127,7 @@ if __name__ == "__main__":
     writer.add_scalar("eval/mean_return", final_eval["mean_return"], args.total_timesteps)
     writer.add_scalar("eval/max_return", final_eval["max_return"], args.total_timesteps)
     writer.add_scalar("eval/num_episodes", final_eval["num_episodes"], args.total_timesteps)
+    writer.add_scalar("eval/partial", final_eval["partial"], args.total_timesteps)
 
     if args.save_model:
         save_path = os.path.join("runs", run_name, f"{args.exp_name}.cleanrl_model")
@@ -899,5 +1135,5 @@ if __name__ == "__main__":
         torch.save(q_network.state_dict(), save_path)
         print(f"model saved to {save_path}")
 
-    envs.close()
+    env.close()
     writer.close()

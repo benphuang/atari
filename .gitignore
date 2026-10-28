@@ -3,3 +3,4 @@ cleanrl_dqn_atari.py
 __pycache__/
 .venv
 INSTRUCTIONS.md
+FIX.md
