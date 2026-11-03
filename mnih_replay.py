@@ -76,8 +76,53 @@ class FrameReplayBuffer:
         self.dones = np.zeros(buffer_size, dtype=np.float32)
         self.episode_starts = np.zeros(buffer_size, dtype=np.bool_)
         self.truncated_next_frames: dict[int, np.ndarray] = {}
+        self.restart_next_observations: dict[int, np.ndarray] = {}
         self.pos = 0
         self.full = False
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "type": "frames",
+            "buffer_size": self.buffer_size,
+            "frame_stack_pad": self.frame_stack_pad,
+            "frames": self.frames,
+            "actions": self.actions,
+            "rewards": self.rewards,
+            "dones": self.dones,
+            "episode_starts": self.episode_starts,
+            "truncated_next_frames": self.truncated_next_frames,
+            "restart_next_observations": self.restart_next_observations,
+            "pos": self.pos,
+            "full": self.full,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state["type"] != "frames" or state["buffer_size"] != self.buffer_size:
+            raise ValueError("Frame replay checkpoint does not match the configured buffer.")
+        if state["frame_stack_pad"] != self.frame_stack_pad:
+            raise ValueError("Frame replay checkpoint uses a different frame-stack padding mode.")
+        for name in ("frames", "actions", "rewards", "dones", "episode_starts"):
+            source = state[name]
+            destination = getattr(self, name)
+            if not isinstance(source, np.ndarray) or source.shape != destination.shape or source.dtype != destination.dtype:
+                raise ValueError(f"Invalid frame replay checkpoint array: {name}")
+            np.copyto(destination, source, casting="no")
+        self.truncated_next_frames = {
+            int(index): np.asarray(frame).copy() for index, frame in state["truncated_next_frames"].items()
+        }
+        self.restart_next_observations = {
+            int(index): np.asarray(obs).copy() for index, obs in state["restart_next_observations"].items()
+        }
+        self.pos = int(state["pos"])
+        self.full = bool(state["full"])
+        if not 0 <= self.pos < self.buffer_size:
+            raise ValueError(f"Invalid replay position {self.pos}.")
+
+    def mark_restart_boundary(self, next_observation: np.ndarray) -> None:
+        if self.pos == 0 and not self.full:
+            return
+        previous = (self.pos - 1) % self.buffer_size
+        self.restart_next_observations[previous] = np.asarray(next_observation).copy()
 
     def add(
         self,
@@ -93,6 +138,7 @@ class FrameReplayBuffer:
         index = self.pos
         next_index = (index + 1) % self.buffer_size
         self.truncated_next_frames.pop(index, None)
+        self.restart_next_observations.pop(index, None)
         self.frames[index] = np.asarray(obs)[0, -1]
         self.episode_starts[index] = episode_start
         self.actions[index] = np.asarray(action).reshape(1)
@@ -138,6 +184,10 @@ class FrameReplayBuffer:
                 next_frame = self.truncated_next_frames.get(int(index), self.frames[next_index])
                 next_stack = np.concatenate((obs_stack[1:], next_frame[None]), axis=0)
             next_observations.append(next_stack)
+        for batch_index, index in enumerate(indices):
+            restart_observation = self.restart_next_observations.get(int(index))
+            if restart_observation is not None:
+                next_observations[batch_index] = restart_observation
 
         return ReplayBufferSamples(
             torch.as_tensor(observations, device=self.device),
@@ -181,17 +231,84 @@ class TruncationAwareReplayBuffer(ReplayBuffer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.truncated_next_observations: dict[int, np.ndarray] = {}
+        self.restart_next_observations: dict[int, np.ndarray] = {}
 
     def add(self, obs, next_obs, action, reward, done, infos) -> None:
         index = self.pos
         self.truncated_next_observations.pop(index, None)
+        self.restart_next_observations.pop(index, None)
         if infos and infos[0].get("_truncated", False):
             self.truncated_next_observations[index] = np.asarray(next_obs)[0].copy()
         super().add(obs, next_obs, action, reward, done, infos)
 
+    def state_dict(self) -> dict[str, Any]:
+        arrays = ("observations", "actions", "rewards", "dones", "timeouts")
+        state = {
+            "type": "stacked",
+            "buffer_size": self.buffer_size,
+            "n_envs": self.n_envs,
+            "optimize_memory_usage": self.optimize_memory_usage,
+            "handle_timeout_termination": self.handle_timeout_termination,
+            "pos": self.pos,
+            "full": self.full,
+            "arrays": {name: getattr(self, name) for name in arrays},
+            "truncated_next_observations": self.truncated_next_observations,
+            "restart_next_observations": self.restart_next_observations,
+        }
+        if not self.optimize_memory_usage:
+            state["arrays"]["next_observations"] = self.next_observations
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        expected = (
+            state["type"] == "stacked"
+            and state["buffer_size"] == self.buffer_size
+            and state["n_envs"] == self.n_envs
+            and state["optimize_memory_usage"] == self.optimize_memory_usage
+            and state["handle_timeout_termination"] == self.handle_timeout_termination
+        )
+        if not expected:
+            raise ValueError("Stacked replay checkpoint does not match the configured buffer.")
+        for name, destination in (
+            (name, getattr(self, name))
+            for name in ("observations", "actions", "rewards", "dones", "timeouts")
+        ):
+            source = state["arrays"][name]
+            if not isinstance(source, np.ndarray) or source.shape != destination.shape or source.dtype != destination.dtype:
+                raise ValueError(f"Invalid stacked replay checkpoint array: {name}")
+            np.copyto(destination, source, casting="no")
+        if not self.optimize_memory_usage:
+            source = state["arrays"]["next_observations"]
+            if source.shape != self.next_observations.shape or source.dtype != self.next_observations.dtype:
+                raise ValueError("Invalid stacked replay checkpoint array: next_observations")
+            np.copyto(self.next_observations, source, casting="no")
+        self.truncated_next_observations = {
+            int(index): np.asarray(obs).copy() for index, obs in state["truncated_next_observations"].items()
+        }
+        self.restart_next_observations = {
+            int(index): np.asarray(obs).copy() for index, obs in state["restart_next_observations"].items()
+        }
+        self.pos = int(state["pos"])
+        self.full = bool(state["full"])
+        if not 0 <= self.pos < self.buffer_size:
+            raise ValueError(f"Invalid replay position {self.pos}.")
+
+    def mark_restart_boundary(self, next_observation: np.ndarray) -> None:
+        if self.pos == 0 and not self.full:
+            return
+        previous = (self.pos - 1) % self.buffer_size
+        self.restart_next_observations[previous] = np.asarray(next_observation).copy()
+
     def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
         samples = super()._get_samples(batch_inds)
         overrides = [self.truncated_next_observations.get(int(index)) for index in batch_inds]
+        if any(observation is not None for observation in overrides):
+            next_observations = samples.next_observations.clone()
+            for batch_index, observation in enumerate(overrides):
+                if observation is not None:
+                    next_observations[batch_index] = torch.as_tensor(observation, device=self.device)
+            samples = samples._replace(next_observations=next_observations)
+        overrides = [self.restart_next_observations.get(int(index)) for index in batch_inds]
         if any(observation is not None for observation in overrides):
             next_observations = samples.next_observations.clone()
             for batch_index, observation in enumerate(overrides):

@@ -23,6 +23,15 @@ from mnih_config import (
     _float_or_none,
     apply_preset,
 )
+from mnih_checkpoint import (
+    CHECKPOINT_VERSION,
+    capture_rng_state,
+    load_checkpoint,
+    restore_rng_state,
+    save_checkpoint,
+    training_config,
+    validate_checkpoint_config,
+)
 from mnih_dqn import (
     DM_RMSProp,
     QNetwork,
@@ -74,6 +83,14 @@ def main() -> None:
     assert args.num_envs == 1, "vectorized envs are not supported"
     if args.replay_storage not in {"stacked", "frames"}:
         raise ValueError(f"Unknown replay storage '{args.replay_storage}'. Expected 'stacked' or 'frames'.")
+    if args.checkpoint_frequency < 0:
+        raise ValueError("checkpoint_frequency must be non-negative.")
+    if args.checkpoint_path is not None and args.checkpoint_frequency == 0:
+        raise ValueError("Set --checkpoint-frequency to a positive value when using --checkpoint-path.")
+    if args.resume_from is not None and args.checkpoint_frequency == 0:
+        raise ValueError("Set --checkpoint-frequency to a positive value when resuming.")
+    if args.checkpoint_frequency > 0 and args.checkpoint_path is None and args.resume_from is None:
+        raise ValueError("--checkpoint-path is required when checkpointing a new run.")
     print(f"Resolved config: {vars(args)}")
 
     if args.loss == "cleanrl" and args.optimizer == "dm_rmsprop":
@@ -81,26 +98,39 @@ def main() -> None:
 
     _print_memory_warning(args.buffer_size, args.replay_storage)
 
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s\n|gymnasium|%s|\n|ale-py|%s|\n|torch|%s|\n|numpy|%s|"
-        % (
-            "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]),
-            gym.__version__,
-            getattr(ale_py, "__version__", "unknown"),
-            torch.__version__,
-            np.__version__,
-        ),
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    checkpoint = load_checkpoint(args.resume_from) if args.resume_from is not None else None
+    if checkpoint is not None:
+        validate_checkpoint_config(checkpoint, args, device)
+        run_name = checkpoint["run_name"]
+        checkpoint_path = args.checkpoint_path or args.resume_from
+        start_step = int(checkpoint["next_step"])
+    else:
+        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        checkpoint_path = args.checkpoint_path
+        start_step = 0
+    run_dir = checkpoint["run_dir"] if checkpoint is not None else os.path.abspath(f"runs/{run_name}")
+    writer = SummaryWriter(run_dir)
+    if checkpoint is None:
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s\n|gymnasium|%s|\n|ale-py|%s|\n|torch|%s|\n|numpy|%s|"
+            % (
+                "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]),
+                gym.__version__,
+                getattr(ale_py, "__version__", "unknown"),
+                torch.__version__,
+                np.__version__,
+            ),
+        )
+    else:
+        print(f"Resuming {run_name} at global_step={start_step} from {args.resume_from}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     env = make_env(
         args.env_id,
         args.seed,
@@ -146,7 +176,7 @@ def main() -> None:
             handle_timeout_termination=False,
         )
     start_time = time.time()
-    obs, _ = env.reset(seed=args.seed)
+    obs, _ = env.reset(seed=args.seed if checkpoint is None else args.seed + start_step)
     episode_start = True
 
     heldout_states_tensor = None
@@ -168,7 +198,19 @@ def main() -> None:
         assert heldout_states.shape[1:] == (4, 84, 84), f"Expected held-out states shaped (N, 4, 84, 84), got {heldout_states.shape}"
         heldout_states_tensor = torch.from_numpy(heldout_states).float().to(device)
 
-    for global_step in range(args.total_timesteps):
+    if checkpoint is not None:
+        q_network.load_state_dict(checkpoint["q_network"])
+        if (target_network is None) != (checkpoint["target_network"] is None):
+            raise ValueError("Checkpoint target-network configuration does not match this run.")
+        if target_network is not None:
+            target_network.load_state_dict(checkpoint["target_network"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        rb.load_state_dict(checkpoint["replay_buffer"])
+        rb.mark_restart_boundary(checkpoint["last_next_observation"])
+        restore_rng_state(checkpoint["rng_state"], env.action_space)
+
+    last_next_observation: np.ndarray | None = None
+    for global_step in range(start_step, args.total_timesteps):
         epsilon = linear_schedule_with_anchor(
             args.start_e,
             args.end_e,
@@ -184,6 +226,7 @@ def main() -> None:
             action = int(torch.argmax(q_values, dim=1).item())
 
         next_obs, reward, terminated, truncated, info = env.step(action)
+        last_next_observation = np.asarray(next_obs).copy()
         if "episode" in info:
             episode_return = float(np.asarray(info["episode"]["r"]).item())
             episode_length = int(np.asarray(info["episode"]["l"]).item())
@@ -225,7 +268,12 @@ def main() -> None:
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", float(loss.item()), global_step)
                     writer.add_scalar("losses/q_values", float(old_val.mean().item()), global_step)
-                    _log_scalar(writer, "charts/SPS", int(global_step / max(time.time() - start_time, 1e-8)), global_step)
+                    _log_scalar(
+                        writer,
+                        "charts/SPS",
+                        int((global_step - start_step) / max(time.time() - start_time, 1e-8)),
+                        global_step,
+                    )
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -265,6 +313,33 @@ def main() -> None:
             writer.add_scalar("eval/num_episodes", metrics["num_episodes"], global_step)
             writer.add_scalar("eval/partial", metrics["partial"], global_step)
 
+        next_step = global_step + 1
+        if (
+            checkpoint_path is not None
+            and args.checkpoint_frequency > 0
+            and (next_step % args.checkpoint_frequency == 0 or next_step == args.total_timesteps)
+        ):
+            assert last_next_observation is not None
+            writer.flush()
+            save_checkpoint(
+                checkpoint_path,
+                {
+                    "version": CHECKPOINT_VERSION,
+                    "next_step": next_step,
+                    "run_name": run_name,
+                    "run_dir": run_dir,
+                    "device_type": device.type,
+                    "config": training_config(args),
+                    "q_network": q_network.state_dict(),
+                    "target_network": target_network.state_dict() if target_network is not None else None,
+                    "optimizer": optimizer.state_dict(),
+                    "replay_buffer": rb.state_dict(),
+                    "last_next_observation": last_next_observation,
+                    "rng_state": capture_rng_state(env.action_space),
+                },
+            )
+            print(f"Checkpoint saved at global_step={next_step}: {checkpoint_path}")
+
     final_eval = _run_eval(
         args.env_id,
         args.seed + 2000,
@@ -288,7 +363,7 @@ def main() -> None:
     writer.add_scalar("eval/partial", final_eval["partial"], args.total_timesteps)
 
     if args.save_model:
-        save_path = os.path.join("runs", run_name, f"{args.exp_name}.cleanrl_model")
+        save_path = os.path.join(run_dir, f"{args.exp_name}.cleanrl_model")
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(q_network.state_dict(), save_path)
         print(f"model saved to {save_path}")

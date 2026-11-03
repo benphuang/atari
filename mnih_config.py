@@ -180,6 +180,12 @@ class Args:
     """replay storage layout: full stacked observations or individual frames"""
     anneal_start: str = CLEANRL_DEFAULTS["anneal_start"]
     preset: str = CLEANRL_DEFAULTS["preset"]
+    checkpoint_path: str | None = None
+    """path for periodic, resumable checkpoints"""
+    checkpoint_frequency: int = 0
+    """agent steps between checkpoints; 0 disables checkpointing"""
+    resume_from: str | None = None
+    """resume training from a checkpoint file"""
 
     def resolved(self) -> "Args":
         return apply_preset(copy.deepcopy(self))
